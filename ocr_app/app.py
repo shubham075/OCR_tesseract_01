@@ -47,6 +47,7 @@ from src.preprocessor import (
 from src.ocr_engine import OCREngine, OCRConfig, PageResult
 from src.postprocessor import TextPostprocessor, PostprocessorConfig
 from src.exporter import export_txt, export_json, export_pdf
+from src.digit_recognizer import DigitRecognizer
 
 
 # 1. Page Config
@@ -182,6 +183,26 @@ with st.sidebar.expander("🔬 OCR Settings", expanded=True):
         index=0
     )
 
+    st.divider()
+    st.markdown("**🔢 Digit Enhancement (CNN)**")
+    enable_digit_cnn = st.checkbox(
+        "Enable handwritten digit correction",
+        value=False,
+        help=(
+            "Uses a local MNIST-trained ONNX CNN to re-classify single digits where "
+            "Tesseract confidence is low. Downloads a ~26 KB model on first use."
+        )
+    )
+    digit_conf_threshold = st.slider(
+        "Correction threshold (Tesseract conf %)",
+        min_value=10,
+        max_value=90,
+        value=60,
+        step=5,
+        disabled=not enable_digit_cnn,
+        help="Digits with Tesseract confidence below this value will be re-checked by CNN."
+    )
+
 # Expander 3: Preprocessing
 with st.sidebar.expander("🛠 Image Preprocessing", expanded=True):
     doc_type = st.radio(
@@ -278,6 +299,11 @@ if uploaded_file is not None:
         st.session_state.current_page_idx = 0
         st.session_state.batch_log = []
         
+        # Clear old text area widget states to avoid rendering stale/empty text
+        for key in list(st.session_state.keys()):
+            if key.startswith("text_area_page_"):
+                del st.session_state[key]
+        
         # Load PDF Handler
         try:
             st.session_state.pdf_handler = PDFHandler(uploaded_file.read())
@@ -295,6 +321,10 @@ else:
     st.session_state.ocr_results = {}
     st.session_state.current_page_idx = 0
     st.session_state.batch_log = []
+    # Clear old text area widget states
+    for key in list(st.session_state.keys()):
+        if key.startswith("text_area_page_"):
+            del st.session_state[key]
     st.info("👋 Upload a PDF file above to begin.")
     st.stop()
 
@@ -330,6 +360,12 @@ elif page_range == "Page Range":
 run_ocr = st.button("🚀 Run OCR Pipeline", type="primary")
 
 if run_ocr:
+    # Clear text area widget state for the pages being processed to ensure fresh OCR text is displayed
+    for page_idx in pages_to_process:
+        key = f"text_area_page_{page_idx}"
+        if key in st.session_state:
+            del st.session_state[key]
+            
     try:
         # Validate installation before running
         engine = OCREngine(ocr_config)
@@ -348,14 +384,17 @@ if run_ocr:
         postprocessor = TextPostprocessor(post_config)
         
         # Batch vs Single Page Execution UI
+        digit_rec = DigitRecognizer(confidence_threshold=digit_conf_threshold) if enable_digit_cnn else None
+
         if len(pages_to_process) > 1:
             with st.status("Running Batch OCR Pipeline...") as status:
                 progress_bar = st.progress(0)
                 st.session_state.batch_log = []
-                
+                cnn_corrections_total = 0
+
                 for idx, page_idx in enumerate(pages_to_process):
                     status.update(label=f"Processing page {page_idx + 1} of {total_pages}...")
-                    
+
                     # 1. Render at full OCR DPI
                     img = pdf_handler.render_page(page_idx, dpi=dpi)
                     # 2. Preprocess
@@ -364,18 +403,36 @@ if run_ocr:
                     result = engine.run_page(clean_img, page_idx)
                     # 4. Postprocess Text
                     result.raw_text = postprocessor.clean(result.raw_text)
-                    
+                    # 5. Optional CNN digit correction
+                    cnn_fixes = 0
+                    if digit_rec is not None:
+                        try:
+                            corrected, corrections = digit_rec.correct_digit_regions(
+                                result.raw_text, result.word_data, clean_img
+                            )
+                            result.raw_text = corrected
+                            cnn_fixes = len(corrections)
+                            cnn_corrections_total += cnn_fixes
+                        except Exception as cnn_err:
+                            st.warning(f"CNN digit correction skipped on page {page_idx + 1}: {cnn_err}")
+
                     st.session_state.ocr_results[page_idx] = result
-                    st.session_state.batch_log.append({
+                    log_entry = {
                         "Page": page_idx + 1,
                         "Confidence": f"{result.confidence:.1f}%",
                         "Words": len(result.word_data[result.word_data["conf"] > -1]) if not result.word_data.empty else 0,
-                        "Time (ms)": f"{result.processing_ms:.0f}"
-                    })
-                    
+                        "Time (ms)": f"{result.processing_ms:.0f}",
+                    }
+                    if enable_digit_cnn:
+                        log_entry["CNN Fixes"] = cnn_fixes
+                    st.session_state.batch_log.append(log_entry)
+
                     progress_bar.progress((idx + 1) / len(pages_to_process))
-                    
-                status.update(label="✅ OCR Batch completed successfully!", state="complete")
+
+                completion_msg = "✅ OCR Batch completed successfully!"
+                if enable_digit_cnn:
+                    completion_msg += f" ({cnn_corrections_total} digit corrections applied)"
+                status.update(label=completion_msg, state="complete")
         else:
             with st.spinner("Processing single page..."):
                 page_idx = pages_to_process[0]
@@ -383,6 +440,17 @@ if run_ocr:
                 clean_img = preprocessor.process(img)
                 result = engine.run_page(clean_img, page_idx)
                 result.raw_text = postprocessor.clean(result.raw_text)
+                # Optional CNN digit correction
+                if digit_rec is not None:
+                    try:
+                        corrected, corrections = digit_rec.correct_digit_regions(
+                            result.raw_text, result.word_data, clean_img
+                        )
+                        result.raw_text = corrected
+                        if corrections:
+                            st.info(f"🔢 CNN corrected {len(corrections)} digit(s) on this page.")
+                    except Exception as cnn_err:
+                        st.warning(f"CNN digit correction skipped: {cnn_err}")
                 st.session_state.ocr_results[page_idx] = result
                 st.success("✅ Page processed successfully!")
                 
@@ -428,7 +496,7 @@ with col_left:
         # Display preview at a low DPI (min of dpi or 150) to prevent memory bloat
         preview_dpi = min(dpi, 150)
         preview_img = pdf_handler.render_page(current_page, dpi=preview_dpi)
-        st.image(preview_img, use_container_width=True)
+        st.image(preview_img, width='stretch')
     except Exception as e:
         st.error(f"Failed to render page preview: {str(e)}")
 
@@ -480,7 +548,7 @@ if st.session_state.ocr_results:
     if st.session_state.batch_log:
         st.subheader("📋 Batch Processing Summary")
         df_summary = pd.DataFrame(st.session_state.batch_log)
-        st.dataframe(df_summary, use_container_width=True, hide_index=True)
+        st.dataframe(df_summary, width='stretch', hide_index=True)
         
     st.subheader("📥 Export Documents")
     
@@ -513,7 +581,7 @@ if st.session_state.ocr_results:
             data=txt_data,
             file_name=f"{os.path.splitext(uploaded_file.name)[0]}_ocr.txt",
             mime="text/plain",
-            use_container_width=True
+            width='stretch'
         )
         
     with btn_col2:
@@ -522,7 +590,7 @@ if st.session_state.ocr_results:
             data=json_data,
             file_name=f"{os.path.splitext(uploaded_file.name)[0]}_ocr.json",
             mime="application/json",
-            use_container_width=True
+            width='stretch'
         )
         
     with btn_col3:
@@ -532,5 +600,5 @@ if st.session_state.ocr_results:
             file_name=f"{os.path.splitext(uploaded_file.name)[0]}_ocr.pdf",
             mime="application/pdf",
             disabled=not pdf_enabled,
-            use_container_width=True
+            width='stretch'
         )
